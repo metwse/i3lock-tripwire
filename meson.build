@@ -97,6 +97,8 @@ ev_dep = cc.find_library('ev')
 
 thread_dep = dependency('threads')
 
+openssl_dep = dependency('openssl', version: '>=3.0', method: 'pkg-config')
+
 i3lock_deps = [
   thread_dep,
   m_dep,
@@ -113,6 +115,7 @@ i3lock_deps = [
   xcb_util_xrm_dep,
   xkbcommon_dep,
   xkbcommon_x11_dep,
+  openssl_dep,
 ]
 
 host_os = host_machine.system()

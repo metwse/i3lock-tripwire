@@ -8,6 +8,9 @@
  */
 #include <config.h>
 
+#include <openssl/sha.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pwd.h>
@@ -83,6 +86,11 @@ int failed_attempts = 0;
 bool show_failed_attempts = false;
 bool show_keyboard_layout = false;
 bool retry_verification = false;
+
+/* The program to run when an incorrect password is entered. */
+static char *wrong_password_handler = NULL;
+static char salt_buf[1024];
+static char *salt_buf_password_start = &salt_buf[0];
 
 struct xkb_state *xkb_state;
 static struct xkb_context *xkb_context;
@@ -183,16 +191,19 @@ static void clear_password_memory(void) {
     /* Use explicit_bzero(3) which was explicitly designed not to be
      * optimized out by the compiler. */
     explicit_bzero(password, strlen(password));
+    explicit_bzero(salt_buf_password_start, strlen(salt_buf_password_start));
 #else
     /* A volatile pointer to the password buffer to prevent the compiler from
      * optimizing this out. */
     volatile char *vpassword = password;
+    volatile char *vsalt_buf_password = salt_buf_password_start;
     for (size_t c = 0; c < sizeof(password); c++) {
         /* We store a non-random pattern which consists of the (irrelevant)
          * index plus (!) the value of the beep variable. This prevents the
          * compiler from optimizing the calls away, since the value of 'beep'
          * is not known at compile-time. */
         vpassword[c] = c + (int)beep;
+        vsalt_buf_password[c] = c + (int)beep;
     }
 #endif
 }
@@ -275,6 +286,81 @@ static void discard_passwd_cb(EV_P_ ev_timer *w, int revents) {
     STOP_TIMER(discard_passwd_timeout);
 }
 
+static void wrong_password_handler_child_cb(EV_P_ ev_child *w, int revents) {
+    ev_child_stop(main_loop, w);
+    DEBUG("wrong password hander process exited with status %d\n", w->rstatus);
+    free(w);
+}
+
+static void handle_wrong_password(void) {
+    /* If we cannot allocate memory for the child watcher or create a pipe,
+     * we skip executing the handler. */
+    ev_child *cw = malloc(sizeof(struct ev_child));
+    if (cw == NULL) {
+        return;
+    }
+    int stdin_pipe[2];
+    if (pipe(stdin_pipe) != 0) {
+        free(cw);
+        return;
+    }
+
+    char hash[SHA256_DIGEST_LENGTH];
+    strcpy(salt_buf_password_start, password);
+    SHA256((const unsigned char *)salt_buf, strlen(salt_buf), (unsigned char *)hash);
+
+    char hash_hex[SHA256_DIGEST_LENGTH * 2 + 2];
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(&hash_hex[i * 2], "%02x", hash[i] & 0xFF);
+    }
+    hash_hex[sizeof(hash_hex) - 2] = '\n';
+    hash_hex[sizeof(hash_hex) - 1] = '\0';
+
+    char failed_attempts_str[4];
+    snprintf(failed_attempts_str, 3, "%d", failed_attempts);
+    failed_attempts_str[3] = '\0';
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        /* Failed to fork */
+    } else if (pid == 0) {
+        char *args[] = {wrong_password_handler, failed_attempts_str, NULL};
+
+        if (dup2(stdin_pipe[0], STDIN_FILENO) < 0) {
+            /* Failed to set stdin pipe */
+            exit(1);
+        }
+
+        close(stdin_pipe[1]);
+
+        execvp(wrong_password_handler, args);
+        /* Failed to exec */
+        exit(1);
+    } else {
+        ev_child_init(cw, wrong_password_handler_child_cb, pid, 0);
+        ev_child_start(main_loop, cw);
+
+        /* Ensure a SIGPIPE failure in write() cannot kill i3lock. Since the
+         * i3lock can fork itself (and reset SIG_IGN), we're ignoring it
+         * here. */
+        signal(SIGPIPE, SIG_IGN);
+
+        close(stdin_pipe[0]);
+        /* We do't want to block i3lock process during write, so only send
+         * password hex if we can make the pipe non-blocking. */
+        int flags = fcntl(stdin_pipe[1], F_GETFL);
+        if (flags != -1 &&
+            fcntl(stdin_pipe[1], F_SETFL, flags | O_NONBLOCK) != -1) {
+            write(stdin_pipe[1], hash_hex, sizeof(hash_hex) - 1 /* trim \0 */);
+        }
+        close(stdin_pipe[1]);
+
+        DEBUG("executed wrong password handler %s, with hash %s",
+              wrong_password_handler,
+              hash_hex /* has \n at the end */);
+    }
+}
+
 static void input_done(void) {
     STOP_TIMER(clear_auth_wrong_timeout);
     auth_state = STATE_AUTH_VERIFY;
@@ -291,6 +377,9 @@ static void input_done(void) {
     if (auth_userokay(pw->pw_name, NULL, NULL, password) != 0) {
         DEBUG("successfully authenticated\n");
         clear_password_memory();
+        if (wrong_password_handler != NULL) {
+            free(wrong_password_handler);
+        }
 
         ev_break(EV_DEFAULT, EVBREAK_ALL);
         return;
@@ -299,6 +388,9 @@ static void input_done(void) {
     if (pam_authenticate(pam_handle, 0) == PAM_SUCCESS) {
         DEBUG("successfully authenticated\n");
         clear_password_memory();
+        if (wrong_password_handler != NULL) {
+            free(wrong_password_handler);
+        }
 
         /* PAM credentials should be refreshed, this will for example update any kerberos tickets.
          * Related to credentials pam_end() needs to be called to cleanup any temporary
@@ -322,10 +414,16 @@ static void input_done(void) {
     if (failed_attempts < 999) {
         failed_attempts += 1;
     }
-    clear_input();
+
     if (unlock_indicator) {
         redraw_screen();
     }
+
+    if (wrong_password_handler != NULL) {
+        handle_wrong_password();
+    }
+
+    clear_input();
 
     /* Clear this state after 2 seconds (unless the user enters another
      * password during that time). */
@@ -1034,6 +1132,8 @@ int main(int argc, char *argv[]) {
         {"inactivity-timeout", required_argument, NULL, 'I'},
         {"show-failed-attempts", no_argument, NULL, 'f'},
         {"show-keyboard-layout", no_argument, NULL, 'k'},
+        {"on-wrong-password", required_argument, NULL, 0},
+        {"password-salt", required_argument, NULL, 0},
         {NULL, no_argument, NULL, 0}};
 
     int code = EXIT_FAILURE;
@@ -1095,6 +1195,14 @@ int main(int argc, char *argv[]) {
                     debug_mode = true;
                 } else if (strcmp(longopts[longoptind].name, "raw") == 0) {
                     image_raw_format = strdup(optarg);
+                } else if (strcmp(longopts[longoptind].name, "on-wrong-password") == 0) {
+                    wrong_password_handler = strdup(optarg);
+                } else if (strcmp(longopts[longoptind].name, "password-salt") == 0) {
+                    int max_salt_len = sizeof(salt_buf) - sizeof(password);
+
+                    strncpy(salt_buf, optarg, max_salt_len);
+                    salt_buf[max_salt_len - 1] = '\0';
+                    salt_buf_password_start = &salt_buf[strlen(salt_buf)];
                 }
                 break;
             case 'f':
@@ -1146,7 +1254,8 @@ int main(int argc, char *argv[]) {
     /* Lock the area where we store the password in memory, we don’t want it to
      * be swapped to disk. Since Linux 2.6.9, this does not require any
      * privileges, just enough bytes in the RLIMIT_MEMLOCK limit. */
-    if (mlock(password, sizeof(password)) != 0) {
+    if (mlock(password, sizeof(password)) != 0 ||
+        mlock(salt_buf, sizeof(salt_buf)) != 0) {
         err(EXIT_FAILURE, "Could not lock page in memory, check RLIMIT_MEMLOCK");
     }
 #endif
