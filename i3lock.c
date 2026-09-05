@@ -317,12 +317,15 @@ static void handle_wrong_password(void) {
     hash_hex[sizeof(hash_hex) - 1] = '\0';
 
     char failed_attempts_str[4];
-    snprintf(failed_attempts_str, 3, "%d", failed_attempts);
+    snprintf(failed_attempts_str, 4, "%d", failed_attempts);
     failed_attempts_str[3] = '\0';
 
     pid_t pid = fork();
     if (pid < 0) {
         /* Failed to fork */
+        close(stdin_pipe[0]);
+        close(stdin_pipe[1]);
+        free(cw);
     } else if (pid == 0) {
         char *args[] = {wrong_password_handler, failed_attempts_str, NULL};
 

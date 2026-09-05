@@ -155,6 +155,33 @@ Show the current keyboard layout.
 Enables debug logging.
 Note, that this will log the password used for authentication to stdout.
 
+.TP
+.BI \fB\-\-on-wrong-password= program
+Execute \fIprogram\fR after an incorrect password is entered. The SHA-256
+digest of the concatenated salt and entered password is written to the
+program's standard input as hexadecimal, followed by a newline. The total
+number of failed password attempts is passed as the program's first argument.
+Note: The program is executed directly without invoking a shell.
+
+The following handler powers off the computer if the received password digest
+matches the specified value or if the number of failed password attempts
+exceeds 10, assuming the handler have sufficient privileges to invoke
+.BR poweroff (8):
+
+.Vb 6
+\&	#!/bin/sh
+\&	FAILED_ATTEMPTS=$1
+\&	PASSWORD_HASH=$(cat)
+\&	if [ "$PASSWORD_HASH" = '2597a7ca...' ] || [ "$FAILED_ATTEMPTS" -gt '10' ]; then
+\&	        poweroff
+\&	fi
+.Ve
+
+.TP
+.BI \fB\-\-password-salt= salt
+Prepend \fIsalt\fR to the entered password before computing SHA-256 digest,
+optional. Use a high-entropy random salt to prevent precomputed lookup attacks.
+
 .SH DPMS
 
 The \-d (\-\-dpms) option was removed from i3lock in version 2.8. There were

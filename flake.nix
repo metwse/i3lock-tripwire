@@ -22,6 +22,7 @@
           xorg.libxcb
           xorg.xcbutil
           xorg.xcbutilimage
+          openssl
         ];
       };
     };
